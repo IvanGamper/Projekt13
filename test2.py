@@ -6,7 +6,7 @@ import pandas as pd
 from contextlib import contextmanager
 
 
-# --------------------
+# --------------------d
 # Konfiguration: hier die DB-Zugangsdaten anpassen
 # --------------------
 DB_CONFIG = {
