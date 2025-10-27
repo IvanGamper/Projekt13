@@ -22,11 +22,9 @@ DB_CONFIG = {
     "autocommit": False,
 }
 
-
 STATI = ["Neu", "In Bearbeitung", "Warten auf Benutzer", "Gelöst", "Geschlossen"]
 PRIO = ["Niedrig", "Normal", "Hoch", "Kritisch"]
 CATS = ["Hardware", "Software", "Netzwerk", "Sonstiges"]
-
 
 # --------------------
 # Einfacher DB-Context-Manager
@@ -43,7 +41,6 @@ def get_conn():
         raise
     finally:
         conn.close()
-
 
 # --------------------
 # Hilfsfunktionen: Hashen, sichere Indizes etc.
@@ -87,17 +84,20 @@ def query_execute(sql: str, params: tuple = ()):
             cur.execute(sql, params)
             return getattr(cur, "lastrowid", 0) or 0
 
-
 # --------------------
 # Auth / Users
 # --------------------
 def get_user_by_username(username: str):
     rows = query_fetchall(
-        "SELECT id, username, role, password_hash FROM users WHERE username=%s AND active=1",
-        (username,)
+        "SELECT id, username, role, password_hash, active FROM users WHERE username=%s",
+        (username.strip(),)
     )
-    return rows[0] if rows else None
-
+    if not rows:
+        return None
+    user = rows[0]
+    if user["active"] != 1:
+        return None
+    return user
 
 def login_user(username: str, password: str):
     u = get_user_by_username(username.strip())
@@ -116,14 +116,13 @@ def create_user(username: str, password: str, role: str = "user"):
 
 
 def list_users():
-    return query_fetchall(
-        "SELECT id, username, role FROM users WHERE active=1 ORDER BY username"
-    )
+    return query_fetchall("SELECT id, username, role FROM users WHERE active=1 ORDER BY username")
 
-#Löschen-Deaktivieren
-def deactivate_user(user_id: int):
-    query_execute("Update users SET active=0, deleted_at=NOW() WHERE id=%s", (user_id,)
-                  )
+def deactivate_user(user_id:int):
+    query_execute("UPDATE users SET active=0, deleted_at=NOW() WHERE id=%s", (user_id,))
+
+
+
 
 # --------------------
 # Tickets: Erstellen, Lesen, Aktualisieren
@@ -162,7 +161,7 @@ def update_ticket(tid, **fields):
     if not fields:
         return
     # updated_at setzen wir serverseitig auf UTC-String
-    fields["updated_at"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     set_clause = ", ".join(f"{k}=%s" for k in fields.keys())
     params = list(fields.values()) + [tid]
     query_execute(f"UPDATE tickets SET {set_clause} WHERE id=%s", tuple(params))
@@ -278,11 +277,29 @@ def page_database():
                     st.rerun()
                 else:
                     st.error("Username und Passwort erforderlich.")
+        st.subheader("Benutzer deaktivieren")
+    if not users:
+        st.info("Keine aktiven Benutzer vorhanden.")
+    else:
+        victim = st.selectbox("Benutzer auswählen", users, format_func=lambda x: x["username"])
+        confirm = st.text_input("Zur Bestätigung Benutzernamen erneut eingeben")
+        sure = st.checkbox("Ich bin sicher")
+
+        # nicht sich selbst deaktivieren
+        is_self = ("user_id" in st.session_state) and (victim["id"] == st.session_state["user_id"])
+        if is_self:
+            st.warning("Du kannst dich nicht selbst deaktivieren.")
+
+        if st.button("🗑️ Benutzer deaktivieren", disabled=is_self or not sure or confirm != victim["username"]):
+            deactivate_user(victim["id"])
+            st.success(f"Benutzer '{victim['username']}' wurde deaktiviert.")
+            st.rerun()
 
 
-    with tab2:
-        tickets = query_fetchall("SELECT * FROM tickets ORDER BY updated_at DESC")
-        st.dataframe(pd.DataFrame(tickets), use_container_width=True)
+
+        with tab2:
+                tickets = query_fetchall("SELECT * FROM tickets ORDER BY updated_at DESC")
+                st.dataframe(pd.DataFrame(tickets), use_container_width=True)
 
 
 def page_profile():
