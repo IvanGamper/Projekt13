@@ -1,271 +1,258 @@
-import pymysql
-from datetime import datetime, timezone
-import bcrypt
 import streamlit as st
-import pandas as pd
-from contextlib import contextmanager
+import sqlite3
+from datetime import datetime
 
-# Konfiguration
-DB_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "Xyz1343!!!",
-    "database": "ticketsystemabkoo1",
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-    "autocommit": False,
-}
+# --- 1. Datenbank-Teil ---
 
-STATI = ["Neu", "In Bearbeitung", "Warten", "Gelöst", "Geschlossen"]
-PRIO = ["Niedrig", "Normal", "Hoch", "Kritisch"]
-CATS = ["Hardware", "Software", "Netzwerk", "Sonstiges"]
+DATABASE_NAME = "ticketsystem_lernversion.db"
 
-# Icons für bessere Übersicht
-ICONS = {
-    "Neu": "🔵", "In Bearbeitung": "🟡", "Warten": "🟠", "Gelöst": "🟢", "Geschlossen": "⚫",
-    "Niedrig": "🟢", "Normal": "🟡", "Hoch": "🟠", "Kritisch": "🔴"
-}
+def get_db_connection():
+    """Stellt eine Verbindung zur SQLite-Datenbank her."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    # Erlaubt den Zugriff auf Spalten per Namen (z.B. row["username"])
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# ==================== Datenbank ====================
-@contextmanager
-def get_conn():
-    conn = pymysql.connect(**DB_CONFIG)
-    try:
-        yield conn
-        conn.commit()
-    except:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+def init_db():
+    """Erstellt die Datenbanktabellen, falls sie noch nicht existieren."""
+    conn = get_db_connection()
+    c = conn.cursor()
 
-def query(sql, params=()):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall() if cur.description else cur.lastrowid
+    # Tabelle für Benutzer
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL, -- WICHTIG: Kein Hashing, nur für Lernzwecke!
+            role TEXT NOT NULL DEFAULT 'user' -- 'user' oder 'admin'
+        )
+    """)
 
-# ==================== User ====================
-def login_user(username, password):
-    users = query("SELECT * FROM users WHERE username=%s AND active=1", (username,))
-    if users and bcrypt.checkpw(password.encode(), users[0]["password_hash"].encode()):
-        return users[0]
-    return None
+    # Tabelle für Tickets
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Neu',
+            priority TEXT NOT NULL DEFAULT 'Mittel',
+            creator_id INTEGER NOT NULL,
+            assignee_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (creator_id) REFERENCES users(id),
+            FOREIGN KEY (assignee_id) REFERENCES users(id)
+        )
+    """)
 
-def create_user(username, password, role="user"):
-    hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    query("INSERT INTO users (username, password_hash, role) VALUES (%s,%s,%s)", (username, hash, role))
+    # Beispiel-Benutzer hinzufügen (falls die Tabelle leer ist)
+    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", ('admin', 'admin', 'admin'))
+    c.execute("INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)", ('user', 'user', 'user'))
 
-def list_users():
-    return query("SELECT * FROM users WHERE active=1 ORDER BY username")
+    conn.commit()
+    conn.close()
 
-# ==================== Tickets ====================
-def create_ticket(title, desc, cat, prio, user_id):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    query("INSERT INTO tickets (title, description, category, status, priority, creator_id, created_at, updated_at) VALUES (%s,%s,%s,'Neu',%s,%s,%s,%s)",
-          (title, desc, cat, prio, user_id, now, now))
+def get_user_by_credentials(username, password):
+    """Sucht einen Benutzer anhand von Benutzername und Passwort."""
+    conn = get_db_connection()
+    user = conn.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password)).fetchone()
+    conn.close()
+    return user
 
-def get_tickets(archived=False, search=""):
-    sql = """
-        SELECT t.*, u.username AS creator, a.username AS assignee
+def get_all_users():
+    """Gibt eine Liste aller Benutzer zurück."""
+    conn = get_db_connection()
+    users = conn.execute("SELECT id, username FROM users ORDER BY username").fetchall()
+    conn.close()
+    return users
+
+def create_ticket(title, description, category, priority, creator_id):
+    """Fügt ein neues Ticket in die Datenbank ein."""
+    conn = get_db_connection()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+        INSERT INTO tickets (title, description, category, priority, creator_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (title, description, category, priority, creator_id, now, now))
+    conn.commit()
+    conn.close()
+
+def get_my_tickets(user_id):
+    """Holt alle Tickets, die von einem bestimmten Benutzer erstellt wurden."""
+    conn = get_db_connection()
+    tickets = conn.execute("""
+        SELECT t.*, u_creator.username AS creator_name, u_assignee.username AS assignee_name
         FROM tickets t
-        JOIN users u ON u.id = t.creator_id
-        LEFT JOIN users a ON a.id = t.assignee_id
-        WHERE t.archived = %s AND (t.title LIKE %s OR t.description LIKE %s)
+        JOIN users u_creator ON t.creator_id = u_creator.id
+        LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+        WHERE t.creator_id = ?
         ORDER BY t.updated_at DESC
-    """
-    return query(sql, (archived, f"%{search}%", f"%{search}%"))
+    """, (user_id,)).fetchall()
+    conn.close()
+    return tickets
 
-def update_ticket(tid, **fields):
-    if not fields:
+def get_all_tickets():
+    """Holt alle Tickets aus der Datenbank."""
+    conn = get_db_connection()
+    tickets = conn.execute("""
+        SELECT t.*, u_creator.username AS creator_name, u_assignee.username AS assignee_name
+        FROM tickets t
+        JOIN users u_creator ON t.creator_id = u_creator.id
+        LEFT JOIN users u_assignee ON t.assignee_id = u_assignee.id
+        ORDER BY t.updated_at DESC
+    """).fetchall()
+    conn.close()
+    return tickets
+
+def update_ticket(ticket_id, status, priority, assignee_id):
+    """Aktualisiert ein bestehendes Ticket."""
+    conn = get_db_connection()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+        UPDATE tickets
+        SET status = ?, priority = ?, assignee_id = ?, updated_at = ?
+        WHERE id = ?
+    """, (status, priority, assignee_id, now, ticket_id))
+    conn.commit()
+    conn.close()
+
+# --- 2. Streamlit App-Teil ---
+
+# --- Initialisierung ---
+# Stellt sicher, dass die DB und Tabellen existieren, bevor die App startet
+init_db()
+
+# --- Konstanten für die UI ---
+STATI = ["Neu", "In Bearbeitung", "Gelöst"]
+PRIORITIES = ["Niedrig", "Mittel", "Hoch"]
+CATEGORIES = ["Hardware", "Software", "Netzwerk"]
+
+# --- UI-Funktionen für Login & Navigation ---
+def show_login():
+    """Zeigt das Login-Formular in der Sidebar an."""
+    st.sidebar.subheader("Login")
+    username = st.sidebar.text_input("Benutzername")
+    password = st.sidebar.text_input("Passwort", type="password")
+    if st.sidebar.button("Anmelden"):
+        # Datenbankfunktion aufrufen, um Benutzer zu prüfen
+        user = get_user_by_credentials(username, password)
+        if user:
+            # Benutzerinformationen im Session State speichern
+            st.session_state["user_id"] = user["id"]
+            st.session_state["username"] = user["username"]
+            st.session_state["role"] = user["role"]
+            st.rerun() # Seite neu laden, um App-Ansicht zu zeigen
+        else:
+            st.sidebar.error("Falsche Anmeldedaten")
+
+def show_navbar():
+    """Zeigt die Navigation in der Sidebar für eingeloggte Benutzer an."""
+    st.sidebar.subheader(f'Angemeldet als {st.session_state["username"]}')
+
+    # Seitenliste, Admin-Seite nur für Admins
+    pages = ["Meine Tickets", "Ticket erstellen"]
+    if st.session_state["role"] == "admin":
+        pages.append("Admin")
+
+    # Seitenauswahl
+    page = st.sidebar.radio("Navigation", pages)
+
+    # Logout-Button
+    if st.sidebar.button("Logout"):
+        # Session State leeren
+        for key in ["user_id", "username", "role"]:
+            st.session_state.pop(key, None)
+        st.rerun() # Seite neu laden, um Login-Ansicht zu zeigen
+
+    return page
+
+# --- UI-Funktionen für die einzelnen Seiten ---
+def page_my_tickets():
+    """Zeigt die Tickets des angemeldeten Benutzers an."""
+    st.header("Meine Tickets")
+    my_tickets = get_my_tickets(st.session_state["user_id"])
+
+    if not my_tickets:
+        st.info("Du hast noch keine Tickets erstellt.")
         return
-    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    sql = "UPDATE tickets SET " + ", ".join(f"{k}=%s" for k in fields) + " WHERE id=%s"
-    query(sql, tuple(fields.values()) + (tid,))
 
-# ==================== UI Komponenten ====================
-def ticket_card(t):
-    """Kompakte Ticket-Darstellung"""
-    st.markdown(f"{ICONS.get(t['status'],'⚪')} {ICONS.get(t['priority'],'⚪')} **#{t['id']} {t['title']}**")
-    st.caption(f"{t['category']} • {t.get('assignee') or 'Niemand'}")
-    st.write((t['description'][:100] + "…") if len(t['description']) > 100 else t['description'])
+    # Jedes Ticket in einem eigenen Container anzeigen
+    for ticket in my_tickets:
+        with st.container(border=True):
+            st.subheader(f'#{ticket["id"]}: {ticket["title"]}')
+            st.write(ticket["description"])
+            st.caption(f'Status: {ticket["status"]} | Priorität: {ticket["priority"]} | Kategorie: {ticket["category"]}')
+            assignee = ticket["assignee_name"] or "Nicht zugewiesen"
+            st.caption(f'Erstellt von: {ticket["creator_name"]} | Bearbeiter: {assignee}')
 
-def move_status(current, direction):
-    """Status vor/zurück bewegen"""
-    try:
-        idx = STATI.index(current)
-        return STATI[max(0, min(len(STATI)-1, idx + direction))]
-    except:
-        return current
-
-# ==================== Seiten ====================
-def page_login():
-    st.title("🎫 Ticketsystem Login")
-    with st.form("login"):
-        user = st.text_input("Benutzername")
-        pw = st.text_input("Passwort", type="password")
-        if st.form_submit_button("Login"):
-            u = login_user(user, pw)
-            if u:
-                st.session_state.update({"user_id": u["id"], "role": u["role"], "username": u["username"]})
-                st.rerun()
-            else:
-                st.error("Falsche Zugangsdaten")
-
-def page_kanban():
-    st.header("🎫 Kanban Board")
-
-    # Filter
-    col1, col2 = st.columns([3, 1])
-    search = col1.text_input("🔍 Suche", placeholder="Tickets durchsuchen...")
-    show_arch = col2.checkbox("📦 Archiv")
-
-    tickets = get_tickets(archived=show_arch, search=search)
-    users = list_users()
-    user_map = {u["id"]: u["username"] for u in users}
-    user_opts = [None] + [u["id"] for u in users]
-
-    # Kanban Spalten
-    cols = st.columns(len(STATI))
-    for idx, status in enumerate(STATI):
-        with cols[idx]:
-            st.subheader(f"{ICONS[status]} {status}")
-            status_tickets = [t for t in tickets if t["status"] == status]
-
-            for t in status_tickets:
-                with st.container(border=True):
-                    ticket_card(t)
-
-                    c1, c2, c3 = st.columns([1,1,2])
-
-                    # Status Navigation
-                    if c1.button("⬅️", key=f"l{t['id']}", help="Zurück"):
-                        update_ticket(t["id"], status=move_status(status, -1))
-                        st.rerun()
-                    if c2.button("➡️", key=f"r{t['id']}", help="Vor"):
-                        update_ticket(t["id"], status=move_status(status, 1))
-                        st.rerun()
-
-                    # Bearbeiter
-                    curr = t.get("assignee_id") or None
-                    idx = user_opts.index(curr) if curr in user_opts else 0
-                    assignee = c3.selectbox(
-                        "Bearbeiter", user_opts, idx,
-                        format_func=lambda x: "—" if x is None else user_map.get(x, "?"),
-                        key=f"a{t['id']}", label_visibility="collapsed"
-                    )
-
-                    # Speichern
-                    if st.button("💾", key=f"s{t['id']}", use_container_width=True):
-                        update_ticket(t["id"], assignee_id=assignee)
-                        st.success("✅")
-                        st.rerun()
-
-def page_create():
-    st.header("➕ Ticket erstellen")
-    with st.form("create"):
+def page_create_ticket():
+    """Zeigt ein Formular zum Erstellen eines neuen Tickets."""
+    st.header("Neues Ticket erstellen")
+    with st.form("create_form"):
         title = st.text_input("Titel")
-        desc = st.text_area("Beschreibung", height=150)
-        col1, col2 = st.columns(2)
-        cat = col1.selectbox("Kategorie", CATS)
-        prio = col2.selectbox("Priorität", PRIO, index=1)
+        description = st.text_area("Beschreibung")
+        category = st.selectbox("Kategorie", CATEGORIES)
+        priority = st.selectbox("Priorität", PRIORITIES, index=1)
 
-        if st.form_submit_button("Erstellen"):
-            if title and desc:
-                create_ticket(title, desc, cat, prio, st.session_state.user_id)
-                st.success("✅ Ticket erstellt!")
-                st.rerun()
+        submitted = st.form_submit_button("Ticket erstellen")
+        if submitted:
+            if title and description:
+                create_ticket(title, description, category, priority, st.session_state["user_id"])
+                st.success("Ticket erfolgreich erstellt!")
             else:
-                st.error("Titel und Beschreibung erforderlich")
+                st.error("Titel und Beschreibung sind erforderlich.")
 
 def page_admin():
-    st.header("🔧 Admin")
+    """Zeigt das Admin-Dashboard zur Verwaltung aller Tickets."""
+    st.header("Admin-Dashboard")
+    all_tickets = get_all_tickets()
 
-    tickets = get_tickets(archived=st.checkbox("Archivierte"))
-    users = list_users()
-    user_map = {u["id"]: u["username"] for u in users}
-    user_opts = [None] + [u["id"] for u in users]
-
-    for t in tickets:
-        with st.expander(f"#{t['id']} {t['title']}"):
-            st.write(t["description"])
-            st.caption(f"Von: {t['creator']} → {t.get('assignee') or '—'}")
-
-            c1, c2, c3, c4 = st.columns(4)
-            status = c1.selectbox("Status", STATI, STATI.index(t["status"]), key=f"st{t['id']}")
-            prio = c2.selectbox("Priorität", PRIO, PRIO.index(t["priority"]), key=f"pr{t['id']}")
-            cat = c3.selectbox("Kategorie", CATS, CATS.index(t["category"]), key=f"ct{t['id']}")
-
-            curr = t.get("assignee_id") or None
-            idx = user_opts.index(curr) if curr in user_opts else 0
-            assignee = c4.selectbox("Bearbeiter", user_opts, idx,
-                                    format_func=lambda x: "—" if x is None else user_map.get(x, "?"),
-                                    key=f"as{t['id']}")
-
-            arch = st.checkbox("Archivieren", bool(t.get("archived")), key=f"ar{t['id']}")
-
-            if st.button("Speichern", key=f"sv{t['id']}"):
-                update_ticket(t["id"], status=status, priority=prio, category=cat,
-                              assignee_id=assignee, archived=int(arch))
-                st.success("✅")
-                st.rerun()
-
-def page_database():
-    st.header("🗄️ Datenbank")
-
-    tab1, tab2 = st.tabs(["Benutzer", "Tickets"])
-
-    with tab1:
-        st.dataframe(pd.DataFrame(list_users()), use_container_width=True)
-
-        with st.form("new_user"):
-            st.subheader("Neuer Benutzer")
-            col1, col2, col3 = st.columns(3)
-            u = col1.text_input("Username")
-            p = col2.text_input("Passwort", type="password")
-            r = col3.selectbox("Rolle", ["user", "admin"])
-
-            if st.form_submit_button("Erstellen"):
-                if u and p:
-                    create_user(u, p, r)
-                    st.success("✅ Benutzer erstellt")
-                    st.rerun()
-
-    with tab2:
-        tickets = query("SELECT * FROM tickets ORDER BY updated_at DESC")
-        st.dataframe(pd.DataFrame(tickets), use_container_width=True)
-
-def page_profile():
-    st.header("👤 Profil")
-    st.write(f"**{st.session_state.username}** ({st.session_state.role})")
-    if st.button("Logout"):
-        for k in ["user_id", "role", "username"]:
-            st.session_state.pop(k, None)
-        st.rerun()
-
-# ==================== Main ====================
-def main():
-    st.set_page_config(page_title="Ticketsystem", layout="wide", page_icon="🎫")
-
-    if "user_id" not in st.session_state:
-        page_login()
+    if not all_tickets:
+        st.info("Es sind keine Tickets vorhanden.")
         return
 
-    st.sidebar.title("🎫 Ticketsystem")
-    st.sidebar.caption(f"Angemeldet: {st.session_state.username}")
+    # Benutzerliste für die Zuweisung von Tickets
+    users = get_all_users()
+    user_map = {user["id"]: user["username"] for user in users}
+    user_ids = [None] + list(user_map.keys()) # [None] für "Keiner"
 
-    pages = {
-        "Kanban": page_kanban,
-        "Erstellen": page_create,
-        "Profil": page_profile
-    }
+    # Jedes Ticket in einem Expander anzeigen, um die Seite übersichtlich zu halten
+    for ticket in all_tickets:
+        with st.expander(f'Ticket #{ticket["id"]}: {ticket["title"]}'):
+            st.write(ticket["description"])
+            st.caption(f'Erstellt von: {ticket["creator_name"]}')
 
-    if st.session_state.role == "admin":
-        pages.update({"Admin": page_admin, "Datenbank": page_database})
+            # Spalten für die Bearbeitungsfelder
+            col1, col2, col3 = st.columns(3)
+            new_status = col1.selectbox("Status", STATI, index=STATI.index(ticket["status"]), key=f'status_{ticket["id"]}')
+            new_priority = col2.selectbox("Priorität", PRIORITIES, index=PRIORITIES.index(ticket["priority"]), key=f'prio_{ticket["id"]}')
 
-    choice = st.sidebar.radio("Navigation", list(pages.keys()))
-    pages[choice]()
+            # Index des aktuellen Bearbeiters finden
+            assignee_index = 0
+            if ticket["assignee_id"] in user_ids:
+                assignee_index = user_ids.index(ticket["assignee_id"])
+            new_assignee_id = col3.selectbox("Bearbeiter", user_ids, index=assignee_index, format_func=lambda x: user_map.get(x, "Keiner"), key=f'assignee_{ticket["id"]}')
 
-if __name__ == "__main__":
-    main()
+            # Speicher-Button
+            if st.button("Speichern", key=f'save_{ticket["id"]}'):
+                update_ticket(ticket["id"], new_status, new_priority, new_assignee_id)
+                st.success(f'Ticket #{ticket["id"]} aktualisiert.')
+                st.rerun()
+
+# --- Hauptlogik der App ---
+st.title("Einfaches Ticketsystem für Lernzwecke")
+
+# Prüfen, ob der Benutzer eingeloggt ist
+if "user_id" not in st.session_state:
+    # Wenn nicht eingeloggt, zeige Login-Seite
+    show_login()
+else:
+    # Wenn eingeloggt, zeige Navigation und die ausgewählte Seite
+    page = show_navbar()
+    if page == "Meine Tickets":
+        page_my_tickets()
+    elif page == "Ticket erstellen":
+        page_create_ticket()
+    elif page == "Admin":
+        page_admin()
