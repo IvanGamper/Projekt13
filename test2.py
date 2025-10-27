@@ -140,19 +140,24 @@ def create_ticket(title, description, category, priority, creator_id):
 def fetch_tickets(creator_id=None, archived=False):
     params = []
     where = []
+
     if not archived:
         where.append("t.archived = 0")
     if creator_id is not None:
         where.append("t.creator_id = %s")
         params.append(creator_id)
+
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
     sql = f"""
-       SELECT t.*, u.username AS creator_name, a.username AS assignee_name
-       FROM tickets t
-       JOIN users u ON u.id = t.creator_id
-       LEFT JOIN users a ON a.id = t.assignee_id
-       {where_sql}
-       ORDER BY t.updated_at DESC
+       SELECT t.*,
+                COALESCE(u.username, '(gelöschter Nutzer)') AS creator_name,
+                COALESCE(a.username, '—') AS assignee_name
+        FROM tickets t
+        LEFT JOIN users u ON u.id = t.creator_id
+        LEFT JOIN users a ON a.id = t.assignee_id
+        {where_sql}
+        ORDER BY t.updated_at DESC
    """
     return query_fetchall(sql, tuple(params))
 
@@ -195,14 +200,47 @@ def page_login():
 
 
 def page_my_tickets():
-    st.header("Meine Tickets")
+    st.header("Tickets (alle)")
     show_arch = st.checkbox("Archivierte anzeigen")
-    tickets = fetch_tickets(creator_id=st.session_state.user_id, archived=show_arch)
+    tickets = fetch_tickets(archived=show_arch)  # <- kein creator_id-Filter mehr!
+
     if not tickets:
         st.info("Keine Tickets gefunden.")
         return
+
+    # Für Assignee-Auswahl
+    users = list_users()
+    user_map = {u["id"]: u["username"] for u in users}
+    user_ids = [None] + [u["id"] for u in users]
+
     for t in tickets:
         show_ticket(t)
+        c1, c2, c3, c4 = st.columns(4)
+        status = c1.selectbox(f"Status #{t['id']}", STATI,
+                              index=safe_index(STATI, t.get("status")),
+                              key=f"st_{t['id']}")
+        prio = c2.selectbox(f"Priorität #{t['id']}", PRIO,
+                            index=safe_index(PRIO, t.get("priority"), 1),
+                            key=f"pr_{t['id']}")
+        cat = c3.selectbox(f"Kategorie #{t['id']}", CATS,
+                           index=safe_index(CATS, t.get("category")),
+                           key=f"cat_{t['id']}")
+
+        cur = t.get("assignee_id")
+        a_index = 0 if cur in (None, 0) else (user_ids.index(cur) if cur in user_ids else 0)
+        assignee = c4.selectbox(f"Bearbeiter #{t['id']}", user_ids, index=a_index,
+                                format_func=lambda v: "—" if v is None else user_map.get(v, "?"),
+                                key=f"as_{t['id']}")
+
+        arch = st.checkbox(f"Archivieren #{t['id']}", value=bool(t.get("archived", 0)),
+                           key=f"arch_{t['id']}")
+
+        if st.button(f"Speichern #{t['id']}", key=f"save_{t['id']}"):
+            update_ticket(t["id"], status=status, priority=prio, category=cat,
+                          assignee_id=assignee, archived=int(arch))
+            st.success("Gespeichert")
+            st.rerun()
+
 
 
 def page_create_ticket():
@@ -217,41 +255,6 @@ def page_create_ticket():
         else:
             create_ticket(title.strip(), desc.strip(), cat, prio, st.session_state.user_id)
             st.success("Ticket angelegt.")
-            st.rerun()
-
-
-def page_admin():
-    st.header("Admin: Tickets verwalten")
-    show_arch = st.checkbox("Archivierte anzeigen")
-    tickets = fetch_tickets(archived=show_arch)
-    if not tickets:
-        st.info("Keine Tickets")
-        return
-
-
-    users = list_users()
-    user_map = {u["id"]: u["username"] for u in users}
-    user_ids = [None] + [u["id"] for u in users]
-
-
-    for t in tickets:
-        show_ticket(t)
-        c1, c2, c3, c4 = st.columns(4)
-        status = c1.selectbox(f"Status #{t['id']}", STATI, index=safe_index(STATI, t.get("status")))
-        prio = c2.selectbox(f"Priorität #{t['id']}", PRIO, index=safe_index(PRIO, t.get("priority"), 1))
-        cat = c3.selectbox(f"Kategorie #{t['id']}", CATS, index=safe_index(CATS, t.get("category")))
-        # Assignee: 0 => kein Bearbeiter
-        current_assignee = t.get("assignee_id")
-        assignee_index = 0 if current_assignee in (None, 0) else (user_ids.index(current_assignee) if current_assignee in user_ids else 0)
-        assignee = c4.selectbox(f"Bearbeiter #{t['id']}", user_ids, index=assignee_index,
-                                format_func=lambda v: "—" if v is None else user_map.get(v, "?"))
-        arch = st.checkbox(f"Archivieren #{t['id']}", value=bool(t.get("archived", 0)))
-
-
-        if st.button(f"Speichern #{t['id']}"):
-            update_ticket(t["id"], status=status, priority=prio, category=cat,
-                          assignee_id=assignee, archived=int(arch))
-            st.success("Speichert...")
             st.rerun()
 
 
@@ -278,28 +281,28 @@ def page_database():
                 else:
                     st.error("Username und Passwort erforderlich.")
         st.subheader("Benutzer deaktivieren")
-    if not users:
-        st.info("Keine aktiven Benutzer vorhanden.")
-    else:
-        victim = st.selectbox("Benutzer auswählen", users, format_func=lambda x: x["username"])
-        confirm = st.text_input("Zur Bestätigung Benutzernamen erneut eingeben")
-        sure = st.checkbox("Ich bin sicher")
+        if not users:
+            st.info("Keine aktiven Benutzer vorhanden.")
+        else:
+            victim = st.selectbox("Benutzer auswählen", users, format_func=lambda x: x["username"])
+            confirm = st.text_input("Zur Bestätigung Benutzernamen erneut eingeben")
+            sure = st.checkbox("Ich bin sicher")
 
-        # nicht sich selbst deaktivieren
-        is_self = ("user_id" in st.session_state) and (victim["id"] == st.session_state["user_id"])
-        if is_self:
-            st.warning("Du kannst dich nicht selbst deaktivieren.")
+            # nicht sich selbst deaktivieren
+            is_self = ("user_id" in st.session_state) and (victim["id"] == st.session_state["user_id"])
+            if is_self:
+                st.warning("Du kannst dich nicht selbst deaktivieren.")
 
-        if st.button("🗑️ Benutzer deaktivieren", disabled=is_self or not sure or confirm != victim["username"]):
-            deactivate_user(victim["id"])
-            st.success(f"Benutzer '{victim['username']}' wurde deaktiviert.")
-            st.rerun()
+            if st.button("🗑️ Benutzer deaktivieren", disabled=is_self or not sure or confirm != victim["username"]):
+                deactivate_user(victim["id"])
+                st.success(f"Benutzer '{victim['username']}' wurde deaktiviert.")
+                st.rerun()
 
 
 
-        with tab2:
-                tickets = query_fetchall("SELECT * FROM tickets ORDER BY updated_at DESC")
-                st.dataframe(pd.DataFrame(tickets), use_container_width=True)
+    with tab2:
+            tickets = query_fetchall("SELECT * FROM tickets ORDER BY updated_at DESC")
+            st.dataframe(pd.DataFrame(tickets), use_container_width=True)
 
 
 def page_profile():
@@ -326,7 +329,7 @@ def main():
 
     pages = ["Meine Tickets", "Ticket erstellen"]
     if st.session_state.role == "admin":
-        pages.extend(["Admin", "Datenbank"])
+        pages.extend(["Verwaltung"])
     pages.append("Profil / Logout")
 
 
@@ -335,12 +338,7 @@ def main():
         page_my_tickets()
     elif choice == "Ticket erstellen":
         page_create_ticket()
-    elif choice == "Admin":
-        if st.session_state.role == "admin":
-            page_admin()
-        else:
-            st.error("Kein Zugriff")
-    elif choice == "Datenbank":
+    elif choice == "Verwaltung":
         if st.session_state.role == "admin":
             page_database()
         else:
