@@ -65,6 +65,25 @@ def safe_index(options, value, default=0):
     except Exception:
         return default
 
+def next_status(s: str) -> str:
+    order = STATI
+    try:
+        i = order.index(s)
+        return order[min(i + 1, len(order) - 1)]
+    except ValueError:
+        return s
+
+
+def prev_status(s: str) -> str:
+    order = STATI
+    try:
+        i = order.index(s)
+        return order[max(i - 1, 0)]
+    except ValueError:
+        return s
+
+
+
 
 # --------------------
 # DB-Wrapper: Query und einfache Abfragen
@@ -177,6 +196,13 @@ def show_ticket(t):
     st.caption(f"Von: {t.get('creator_name','?')}  •  Bearbeiter: {t.get('assignee_name','-') or '-'}")
     st.markdown("---")
 
+def kanban_card(t):
+    st.markdown(f"**#{t['id']} — {t['title']}**")
+    st.caption(f"{t.get('category','-')} • {t.get('priority','-')}")
+    st.write((t.get('description') or '')[:220] + ("…" if len(t.get('description') or '') > 220 else ""))
+    st.caption(f"Von: {t.get('creator_name','?')} • Bearbeiter: {t.get('assignee_name','—')}")
+
+
 
 # --------------------
 # Seiten (Login, Erstellen, Meine Tickets, Admin, DB)
@@ -195,14 +221,84 @@ def page_login():
 
 
 def page_my_tickets():
-    st.header("Meine Tickets")
-    show_arch = st.checkbox("Archivierte anzeigen")
-    tickets = fetch_tickets(creator_id=st.session_state.user_id, archived=show_arch)
+    st.header("Tickets (Kanban)")
+    ctop1, ctop2 = st.columns([1,1])
+    show_arch = ctop1.checkbox("Archivierte anzeigen")
+    is_admin = (st.session_state.get("role") == "admin")
+
+    # alle (nicht)archivierten Tickets holen
+    tickets = fetch_tickets(archived=show_arch)
     if not tickets:
         st.info("Keine Tickets gefunden.")
         return
-    for t in tickets:
-        show_ticket(t)
+
+    # Assignee-Auswahl (für Karte)
+    users = list_users()
+    user_map = {u["id"]: u["username"] for u in users}
+    user_ids = [None] + [u["id"] for u in users]
+
+    # Tickets je Status gruppieren
+    cols = st.columns(len(STATI))
+    for idx, status_name in enumerate(STATI):
+        with cols[idx]:
+            st.subheader(status_name)
+            col_tickets = [t for t in tickets if (t.get("status") == status_name)]
+            if not col_tickets:
+                st.caption("—")
+            for t in col_tickets:
+                with st.container(border=True):
+                    # Karte
+                    kanban_card(t)
+
+                    # Navigations- & Edit-Controls
+                    c1, c2, c3 = st.columns([1, 1, 2])
+
+                    # ← / → Status wechseln
+                    with c1:
+                        if st.button("←", key=f"left_{t['id']}", help="Vorheriger Status"):
+                            update_ticket(t["id"], status=prev_status(t["status"]))
+                            st.rerun()
+                    with c2:
+                        if st.button("→", key=f"right_{t['id']}", help="Nächster Status"):
+                            update_ticket(t["id"], status=next_status(t["status"]))
+                            st.rerun()
+
+                    # Bearbeiter setzen
+                    cur = t.get("assignee_id")
+                    a_index = 0 if cur in (None, 0) else (user_ids.index(cur) if cur in user_ids else 0)
+                    assignee = c3.selectbox(
+                        f"Bearbeiter #{t['id']}",
+                        user_ids, index=a_index,
+                        format_func=lambda v: "—" if v is None else user_map.get(v, "?"),
+                        key=f"as_{t['id']}"
+                    )
+
+                    # Archiv nur für Admin
+                    if is_admin:
+                        arch = st.checkbox(
+                            f"Archivieren #{t['id']}",
+                            value=bool(t.get("archived", 0)),
+                            key=f"arch_{t['id']}"
+                        )
+                    else:
+                        st.checkbox(
+                            f"Archiviert (nur Admin) #{t['id']}",
+                            value=bool(t.get("archived", 0)),
+                            key=f"arch_ro_{t['id']}",
+                            disabled=True
+                        )
+                        arch = bool(t.get("archived", 0))
+
+                    # Speichern-Button
+                    if st.button(f"Speichern #{t['id']}", key=f"save_{t['id']}"):
+                        fields = {"assignee_id": assignee}
+
+                        if is_admin:
+                            fields["archived"] = int(arch)
+                        update_ticket(t["id"], **fields)
+                        st.success("Gespeichert")
+                        st.rerun()
+
 
 
 def page_create_ticket():
